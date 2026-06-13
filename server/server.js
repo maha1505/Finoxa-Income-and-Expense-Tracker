@@ -16,21 +16,23 @@ app.use(helmet({
     crossOriginOpenerPolicy: { policy: "same-origin-allow-popups" },
 }));
 
-const allowedOrigins = [
-    'http://localhost:5173',
-    process.env.CLIENT_URL
-].filter(Boolean);
-
 app.use(cors({
     origin: function (origin, callback) {
-        // allow requests with no origin (like mobile apps or curl requests)
-        if (!origin) return callback(null, true);
-        if (allowedOrigins.indexOf(origin) === -1) {
-            var msg = 'The CORS policy for this site does not ' +
-                'allow access from the specified Origin.';
-            return callback(new Error(msg), false);
+        // If CLIENT_URL is set, enforce it; otherwise allow all (dev/first deploy)
+        if (!process.env.CLIENT_URL) {
+            return callback(null, true);
         }
-        return callback(null, true);
+        const allowedOrigins = [
+            'http://localhost:5173',
+            'http://localhost:3000',
+            process.env.CLIENT_URL
+        ].filter(Boolean);
+        // Allow requests with no origin (mobile apps, curl, server-to-server)
+        if (!origin) return callback(null, true);
+        if (allowedOrigins.some(allowed => origin.startsWith(allowed))) {
+            return callback(null, true);
+        }
+        return callback(new Error('CORS: Origin not allowed: ' + origin), false);
     },
     credentials: true
 }));
