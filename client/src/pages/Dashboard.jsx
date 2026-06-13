@@ -80,6 +80,40 @@ const Dashboard = () => {
         } catch (err) { console.error(err); }
     };
 
+    const getRangeForFilter = (data, filter) => {
+        let start, end;
+        if (filter === '30days') {
+            start = moment().subtract(29, 'days').startOf('day');
+            end = moment().endOf('day');
+        } else if (filter === 'month') {
+            start = moment().startOf('month');
+            end = moment().endOf('month');
+        } else if (filter === 'year') {
+            start = moment().startOf('year');
+            end = moment().endOf('year');
+        } else if (filter === 'all') {
+            if (data && data.length > 0) {
+                const sorted = [...data].sort((a, b) => new Date(a.date) - new Date(b.date));
+                start = moment(sorted[0].date).startOf('day');
+                end = moment(sorted[sorted.length - 1].date).endOf('day');
+                if (start.isSame(end, 'day')) {
+                    start = moment(start).subtract(1, 'days');
+                    end = moment(end).add(1, 'days');
+                }
+            } else {
+                start = moment().subtract(29, 'days').startOf('day');
+                end = moment().endOf('day');
+            }
+        } else if (filter === 'custom' && customDateRange.start && customDateRange.end) {
+            start = moment(customDateRange.start).startOf('day');
+            end = moment(customDateRange.end).endOf('day');
+        } else {
+            start = moment().subtract(29, 'days').startOf('day');
+            end = moment().endOf('day');
+        }
+        return { start, end };
+    };
+
     const fetchDashboardData = async () => {
         try {
             const res = await api.get('/transactions/dashboard');
@@ -87,11 +121,19 @@ const Dashboard = () => {
             setOriginalTransactions(transactions);
             setPendingRegret(res.data.pendingRegretEvaluations || []);
 
+            // Check if there are any transactions in the last 30 days
+            const thirtyDaysAgo = moment().subtract(29, 'days').startOf('day');
+            const hasRecent = transactions.some(t => moment(t.date).isSameOrAfter(thirtyDaysAgo));
+
+            const initialFilter = hasRecent ? '30days' : (transactions.length > 0 ? 'all' : '30days');
+            setGraphFilter(initialFilter);
+
             // Recalculate stats locally to merge budget data if budgets are already loaded
-            calculateStats(transactions, budgets);
+            const { start, end } = getRangeForFilter(transactions, initialFilter);
+            calculateStats(transactions, budgets, start, end);
 
             // Initial Logic Application
-            applyGraphFilter(transactions, '30days');
+            applyGraphFilter(transactions, initialFilter);
         } catch (err) { console.error(err); }
     };
 
@@ -100,7 +142,8 @@ const Dashboard = () => {
             const res = await api.get('/budgets');
             setBudgets(res.data);
             // Re-calculate stats with new budget data
-            calculateStats(originalTransactions, res.data);
+            const { start, end } = getRangeForFilter(originalTransactions, graphFilter);
+            calculateStats(originalTransactions, res.data, start, end);
         } catch (err) { console.error(err); }
     };
 
@@ -134,61 +177,59 @@ const Dashboard = () => {
     // Recalculate stats when transactions or budgets change
     useEffect(() => {
         if (originalTransactions.length > 0 || budgets.length > 0) {
-            calculateStats(originalTransactions, budgets);
+            const { start, end } = getRangeForFilter(originalTransactions, graphFilter);
+            calculateStats(originalTransactions, budgets, start, end);
             applyGraphFilter(originalTransactions, graphFilter);
         }
     }, [originalTransactions, budgets, graphFilter, customDateRange.start, customDateRange.end]); // Re-run graph logic on filter change
 
-    const calculateStats = (data, currentBudgets) => {
-        // Stats are global (or typically based on "This Month" for relevance, but user asked for Total Income/Expense)
-        // Usually Total Income/Expense implies "This Month" in dashboards, otherwise lifetime is huge.
-        // Let's stick to "This Month" for the top cards as it's most useful context, unless "Lifecycle" is implied.
-        // Given the graph default is 30 days, "This Month" stats make sense.
+    const calculateStats = (data, currentBudgets, start, end) => {
+        if (!start || !end) {
+            const range = getRangeForFilter(data, graphFilter);
+            start = range.start;
+            end = range.end;
+        }
 
-        const now = moment();
-        const thisMonthTrans = data.filter(t => moment(t.date).isSame(now, 'month'));
+        const rangeTrans = data.filter(t => moment(t.date).isBetween(start, end, 'day', '[]'));
 
-        const income = thisMonthTrans.filter(t => t.type === 'income').reduce((acc, t) => acc + t.amount, 0);
-        const expense = thisMonthTrans.filter(t => t.type === 'expense').reduce((acc, t) => acc + t.amount, 0);
+        const income = rangeTrans.filter(t => t.type === 'income').reduce((acc, t) => acc + t.amount, 0);
+        const expense = rangeTrans.filter(t => t.type === 'expense').reduce((acc, t) => acc + t.amount, 0);
 
         const totalBudgetLimit = currentBudgets?.reduce((acc, b) => acc + b.limit, 0) || 0;
-        const budgetBalance = totalBudgetLimit > 0 ? (totalBudgetLimit - expense) : (income - expense); // Fallback to cash flow if no budget
+        
+        // Scale budget limit by number of months in the range
+        const diffMonths = moment(end).diff(moment(start), 'months', true);
+        const durationMonths = Math.max(1, Math.round(diffMonths));
+        const scaledBudgetLimit = totalBudgetLimit * durationMonths;
 
-        // Expense Change vs Last Month
-        const lastMonthTrans = data.filter(t => moment(t.date).isSame(moment().subtract(1, 'month'), 'month'));
-        const lastMonthExpenses = lastMonthTrans.filter(t => t.type === 'expense').reduce((acc, t) => acc + t.amount, 0);
+        const budgetBalance = totalBudgetLimit > 0 ? (scaledBudgetLimit - expense) : (income - expense);
+
+        // Expense Change vs Previous Period of same length
+        const durationDays = moment(end).diff(moment(start), 'days') + 1;
+        const prevStart = moment(start).subtract(durationDays, 'days');
+        const prevEnd = moment(start).subtract(1, 'days');
+
+        const prevPeriodTrans = data.filter(t => moment(t.date).isBetween(prevStart, prevEnd, 'day', '[]'));
+        const prevExpenses = prevPeriodTrans.filter(t => t.type === 'expense').reduce((acc, t) => acc + t.amount, 0);
+        
         let expenseChange = 0;
-        if (lastMonthExpenses > 0) expenseChange = ((expense - lastMonthExpenses) / lastMonthExpenses) * 100;
-        else if (expense > 0) expenseChange = 100;
+        if (prevExpenses > 0) {
+            expenseChange = ((expense - prevExpenses) / prevExpenses) * 100;
+        } else if (expense > 0) {
+            expenseChange = 100;
+        }
 
         setStats({
             totalIncome: income || 0,
             totalExpense: expense || 0,
             budgetBalance: budgetBalance || (income - expense) || 0,
-            totalBudget: totalBudgetLimit || 0,
+            totalBudget: scaledBudgetLimit || 0,
             expenseChange: expenseChange || 0
         });
     };
 
     const applyGraphFilter = (data, filter) => {
-        const now = moment();
-        let start, end;
-
-        if (filter === '30days') {
-            start = moment().subtract(29, 'days').startOf('day');
-            end = moment().endOf('day');
-        } else if (filter === 'month') {
-            start = moment().startOf('month');
-            end = moment().endOf('month');
-        } else if (filter === 'custom' && customDateRange.start && customDateRange.end) {
-            start = moment(customDateRange.start).startOf('day');
-            end = moment(customDateRange.end).endOf('day');
-        } else {
-            // Default fallback
-            start = moment().subtract(29, 'days').startOf('day');
-            end = moment().endOf('day');
-        }
-
+        const { start, end } = getRangeForFilter(data, filter);
         setCurrentDateRange({ start, end });
 
         if (!data) return;
@@ -236,12 +277,29 @@ const Dashboard = () => {
 
     // Graph Data Preparation
     const getGraphData = () => {
+        const diffDays = moment(currentDateRange.end).diff(moment(currentDateRange.start), 'days');
+        let grouping = 'day'; // 'day', 'week', 'month'
+
+        if (diffDays > 120) {
+            grouping = 'month';
+        } else if (diffDays > 31) {
+            grouping = 'week';
+        }
+
         const grouped = {};
         displayTransactions.forEach(t => {
-            const dateKey = moment(t.date).format('YYYY-MM-DD');
-            if (!grouped[dateKey]) grouped[dateKey] = { income: 0, expense: 0 };
-            if (t.type === 'income') grouped[dateKey].income += t.amount;
-            else grouped[dateKey].expense += t.amount;
+            let key;
+            if (grouping === 'day') {
+                key = moment(t.date).format('YYYY-MM-DD');
+            } else if (grouping === 'week') {
+                key = moment(t.date).startOf('week').format('YYYY-MM-DD');
+            } else {
+                key = moment(t.date).format('YYYY-MM');
+            }
+
+            if (!grouped[key]) grouped[key] = { income: 0, expense: 0 };
+            if (t.type === 'income') grouped[key].income += t.amount;
+            else grouped[key].expense += t.amount;
         });
 
         const labels = [];
@@ -251,15 +309,32 @@ const Dashboard = () => {
         let curr = moment(currentDateRange.start).clone();
         const end = moment(currentDateRange.end).clone();
 
-        while (curr.isSameOrBefore(end, 'day')) {
-            const dateKey = curr.format('YYYY-MM-DD');
-            const label = curr.format('MMM DD');
-
-            labels.push(label);
-            incomeData.push(grouped[dateKey]?.income || 0);
-            expenseData.push(grouped[dateKey]?.expense || 0);
-
-            curr.add(1, 'days');
+        if (grouping === 'day') {
+            while (curr.isSameOrBefore(end, 'day')) {
+                const dateKey = curr.format('YYYY-MM-DD');
+                labels.push(curr.format('MMM DD'));
+                incomeData.push(grouped[dateKey]?.income || 0);
+                expenseData.push(grouped[dateKey]?.expense || 0);
+                curr.add(1, 'days');
+            }
+        } else if (grouping === 'week') {
+            curr = curr.startOf('week');
+            while (curr.isSameOrBefore(end, 'week')) {
+                const dateKey = curr.format('YYYY-MM-DD');
+                labels.push('Wk ' + curr.format('ww') + ' (' + curr.format('MMM DD') + ')');
+                incomeData.push(grouped[dateKey]?.income || 0);
+                expenseData.push(grouped[dateKey]?.expense || 0);
+                curr.add(1, 'weeks');
+            }
+        } else {
+            curr = curr.startOf('month');
+            while (curr.isSameOrBefore(end, 'month')) {
+                const dateKey = curr.format('YYYY-MM');
+                labels.push(curr.format('MMM YYYY'));
+                incomeData.push(grouped[dateKey]?.income || 0);
+                expenseData.push(grouped[dateKey]?.expense || 0);
+                curr.add(1, 'months');
+            }
         }
 
         return {
@@ -430,6 +505,8 @@ const Dashboard = () => {
                             >
                                 <option value="30days">Last 30 Days</option>
                                 <option value="month">This Month</option>
+                                <option value="year">This Year</option>
+                                <option value="all">All Time</option>
                                 <option value="custom">Custom Range</option>
                             </select>
                             {graphFilter === 'custom' && (

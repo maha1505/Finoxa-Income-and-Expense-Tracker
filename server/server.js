@@ -15,8 +15,23 @@ app.use(helmet({
     contentSecurityPolicy: false,
     crossOriginOpenerPolicy: { policy: "same-origin-allow-popups" },
 }));
+
+const allowedOrigins = [
+    'http://localhost:5173',
+    process.env.CLIENT_URL
+].filter(Boolean);
+
 app.use(cors({
-    origin: process.env.CLIENT_URL || 'http://localhost:5173', // Vite default port
+    origin: function (origin, callback) {
+        // allow requests with no origin (like mobile apps or curl requests)
+        if (!origin) return callback(null, true);
+        if (allowedOrigins.indexOf(origin) === -1) {
+            var msg = 'The CORS policy for this site does not ' +
+                'allow access from the specified Origin.';
+            return callback(new Error(msg), false);
+        }
+        return callback(null, true);
+    },
     credentials: true
 }));
 app.use(express.json());
@@ -48,8 +63,18 @@ if (process.env.NODE_ENV === 'production') {
 
 // Error Handler
 app.use((err, req, res, next) => {
-    console.error('Error Stack:', err.stack);
-    res.status(500).json({ msg: 'Server Error', error: err.message });
+    console.error('--- SERVER ERROR ---');
+    console.error('Time:', new Date().toISOString());
+    console.error('Method:', req.method);
+    console.error('URL:', req.originalUrl);
+    console.error('Body:', req.body);
+    console.error('Stack:', err.stack);
+    console.error('--------------------');
+    
+    res.status(500).json({ 
+        msg: 'Server Error', 
+        error: process.env.NODE_ENV === 'production' ? 'Internal Server Error' : err.message 
+    });
 });
 
 // Start Server
